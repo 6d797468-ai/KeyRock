@@ -35,6 +35,7 @@ from rich.text import Text
 
 from keyrock_core.actions import ActionRegistry
 from keyrock_core.config import get_settings
+from keyrock_core.generator import COMPOSITIONS_NOMMEES as _COMPOSITIONS_NOMMEES
 from keyrock_core.service import GenerationResultat, GenerationService
 
 __all__ = [
@@ -87,11 +88,10 @@ COMMANDES: dict[str, str] = {
     "uninstall-shell": "uninstall-shell",
 }
 
-COMPOSITIONS_NOMMEES: dict[str, dict[str, bool]] = {
-    "alpha": {"majuscules": True, "minuscules": True, "chiffres": False, "symboles": False},
-    "alnum": {"majuscules": True, "minuscules": True, "chiffres": True, "symboles": False},
-    "ascii": {"majuscules": True, "minuscules": True, "chiffres": True, "symboles": True},
-}
+# Ré-exporté depuis le noyau : la CLI et l'API doivent partager une seule
+# table de compositions, sinon le contrat publié par `/api/v1/meta` et celui
+# accepté par `kr --composition` divergent.
+COMPOSITIONS_NOMMEES = _COMPOSITIONS_NOMMEES
 
 LIBELLES_COMPOSITION = {
     "majuscules": "Majuscules (A-Z)",

@@ -30,6 +30,10 @@ class KeyRockSettings(BaseSettings):
     token_max_length: int = Field(default=LONGEUR_MAX, ge=LONGEUR_MIN, le=LONGEUR_MAX)
     token_min_entropy: int = Field(default=ENTROPIE_MIN_NIST, ge=0)
     rate_limit_per_minute: int = Field(default=60, ge=1)
+    # Réseaux (CIDR) des reverse proxies dont le X-Forwarded-For est accepté.
+    # Vide par défaut : aucun en-tête n'est cru, l'adresse socket fait foi.
+    trusted_proxies: str = Field(default="")
+    max_tracked_clients: int = Field(default=10_000, ge=16, le=1_000_000)
     cors_allow_origins: list[str] = Field(default_factory=list)
 
     @field_validator("log_level")

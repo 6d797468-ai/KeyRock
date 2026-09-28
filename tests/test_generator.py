@@ -13,8 +13,12 @@ from keyrock_core.generator import (
     ENTROPIE_MIN,
     LONGEUR_MAX,
     LONGEUR_MIN,
+    AlphabetVideError,
     CoreGenerator,
+    EntropieInsuffisanteError,
     GenerationOptions,
+    LongueurHorsBornesError,
+    libelle_composition,
 )
 
 
@@ -80,13 +84,16 @@ class TestEntropie:
         """Avec l'alphabet complet, < 13 caractères reste sous 80 bits."""
         options = GenerationOptions(longueur=longueur)
         assert CoreGenerator.calculer_entropie(options) < ENTROPIE_MIN
-        with pytest.raises(ValueError, match="Entropie insuffisante"):
+        with pytest.raises(EntropieInsuffisanteError) as echec:
             CoreGenerator.valider_entropie(options)
+        # Le message nomme la longueur à atteindre : c'est la correction, pas
+        # un constat. « 52 bits < 80 bits » seul laisse le client deviner.
+        assert "13 caractères" in str(echec.value)
 
     def test_entropie_insuffisante_rejetee(self) -> None:
         options = _options_chiffres_seulement(LONGEUR_MIN)
         assert CoreGenerator.calculer_entropie(options) < ENTROPIE_MIN
-        with pytest.raises(ValueError, match="Entropie insuffisante"):
+        with pytest.raises(EntropieInsuffisanteError, match="25 caractères"):
             CoreGenerator.valider_entropie(options)
 
     def test_seuil_personnalise(self) -> None:
@@ -102,8 +109,14 @@ class TestGenerationOptions:
 
     @pytest.mark.parametrize("longueur", [LONGEUR_MIN - 1, 0, -1, LONGEUR_MAX + 1, 999_999_999])
     def test_longueur_hors_bornes(self, longueur: int) -> None:
-        with pytest.raises(ValueError, match="longueur"):
+        with pytest.raises(LongueurHorsBornesError, match="longueur"):
             GenerationOptions(longueur=longueur)
+
+    def test_erreurs_du_noyau_sont_des_valueerror(self) -> None:
+        """Compatibilité : `ValueError` reste attrapable par le code appelant."""
+        for erreur in (LongueurHorsBornesError, EntropieInsuffisanteError, AlphabetVideError):
+            assert issubclass(erreur, ValueError)
+            assert erreur.code.isupper()
 
     @pytest.mark.parametrize("longueur", [LONGEUR_MIN, 32, LONGEUR_MAX])
     def test_longueur_dans_bornes(self, longueur: int) -> None:
@@ -153,9 +166,113 @@ class TestGeneration:
 
     def test_seuil_entropie_personnalise_bloque(self) -> None:
         options = _options_chiffres_seulement(8)
-        with pytest.raises(ValueError, match="Entropie insuffisante"):
+        with pytest.raises(EntropieInsuffisanteError):
             CoreGenerator.generer_avec_options(options)
         assert len(CoreGenerator.generer_avec_options(options, seuil_entropie=0.0)) == 8
+
+
+class TestLongueurMinimaleEffective:
+    """Le minimum publié doit être le minimum *atteignable*.
+
+    Régression directe du contrat faux : `/api/v1/meta` annonçait
+    `longueur_min = 8`, valeur que le seuil de 80 bits rejette pour tout
+    alphabet. Un client obéissant au contrat recevait un 422.
+    """
+
+    @pytest.mark.parametrize(
+        ("maj", "min_", "chiffres", "symboles", "attendu"),
+        [
+            (True, True, True, True, 13),  # ascii, 94 caractères
+            (True, True, True, False, 14),  # alnum, 62
+            (True, True, False, False, 15),  # alpha, 52
+            (False, False, True, False, 25),  # num, 10
+        ],
+    )
+    def test_minimum_connu_par_alphabet(
+        self, maj: bool, min_: bool, chiffres: bool, symboles: bool, attendu: int
+    ) -> None:
+        minimum = CoreGenerator.longueur_min_effective(maj, min_, chiffres, symboles)
+        assert minimum == attendu
+
+    @pytest.mark.parametrize(
+        ("maj", "min_", "chiffres", "symboles"),
+        [
+            (a, b, c, d)
+            for a in (True, False)
+            for b in (True, False)
+            for c in (True, False)
+            for d in (True, False)
+            if a or b or c or d
+        ],
+    )
+    def test_le_minimum_annonce_est_toujours_atteignable(
+        self, maj: bool, min_: bool, chiffres: bool, symboles: bool
+    ) -> None:
+        """Propriété centrale : le minimum annoncé passe la validation.
+
+        C'est exactement l'invariant violé par l'ancien contrat.
+        """
+        minimum = CoreGenerator.longueur_min_effective(maj, min_, chiffres, symboles)
+        options = GenerationOptions(
+            longueur=minimum,
+            majuscules=maj,
+            minuscules=min_,
+            chiffres=chiffres,
+            symboles=symboles,
+        )
+        assert CoreGenerator.calculer_entropie(options) >= ENTROPIE_MIN
+        assert CoreGenerator.valider_entropie(options) >= ENTROPIE_MIN
+
+    def test_un_caractere_de_moins_echoue(self) -> None:
+        options = GenerationOptions(longueur=12)
+        with pytest.raises(EntropieInsuffisanteError):
+            CoreGenerator.valider_entropie(options)
+
+    def test_seuil_personnalise_change_le_minimum(self) -> None:
+        """Le minimum dépend du seuil : il ne peut pas être une constante."""
+        complet = CoreGenerator.longueur_min_effective(seuil=80.0)
+        exigeant = CoreGenerator.longueur_min_effective(seuil=128.0)
+        assert exigeant > complet
+
+    def test_minimum_jamais_sous_la_borne_de_saisie(self) -> None:
+        """Un seuil très bas ne doit pas annoncer une longueur hors bornes."""
+        assert CoreGenerator.longueur_min_effective(seuil=0.0) == LONGEUR_MIN
+
+    def test_alphabet_vide_refuse(self) -> None:
+        with pytest.raises(AlphabetVideError):
+            CoreGenerator.longueur_min_effective(False, False, False, False)
+
+
+class TestTableDesAlphabets:
+    def test_les_quinze_combinaisons_sont_publiees(self) -> None:
+        table = CoreGenerator.decrire_alphabets()
+        assert len(table) == 15
+        assert "num" in table
+        assert "maj+min+num+sym" in table
+
+    def test_les_compositions_nommees_sont_repertoriees(self) -> None:
+        table = CoreGenerator.decrire_alphabets()
+        noms = {entree["nom"] for entree in table.values()}
+        assert {"alpha", "alnum", "ascii"} <= noms
+
+    def test_libelles_canoniques(self) -> None:
+        assert libelle_composition(True, True, True, True) == "maj+min+num+sym"
+        assert libelle_composition(False, False, True, False) == "num"
+        assert libelle_composition(True, False, False, False) == "maj"
+
+    def test_table_sans_drift_avec_la_fonction(self) -> None:
+        """La table doit être dérivée, jamais recopiée.
+
+        Une table recopiée diverge — c'est exactement ce qui a produit le
+        contrat faux corrigé ici.
+        """
+        for entree in CoreGenerator.decrire_alphabets().values():
+            attendu = max(LONGEUR_MIN, math.ceil(ENTROPIE_MIN / entree["entropie_par_caractere"]))
+            assert entree["longueur_min"] == attendu
+
+    def test_donnees_coherentes(self) -> None:
+        for entree in CoreGenerator.decrire_alphabets().values():
+            assert round(math.log2(entree["alphabet"]), 2) == entree["entropie_par_caractere"]
 
 
 class TestSecurite:

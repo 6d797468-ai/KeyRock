@@ -7,13 +7,15 @@ identifiant de requête) sont journalisées.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import sys
+import threading
 import time
 import uuid
-from collections import defaultdict, deque
-from collections.abc import Awaitable, Callable
+from collections import deque
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -28,6 +30,8 @@ __all__ = [
     "configure_logging",
     "gerer_erreurs",
     "obtenir_request_id",
+    "parse_reseau",
+    "resoudre_ip_client",
 ]
 
 CORRELATION_ID_HEADER = "X-Request-ID"
@@ -49,6 +53,35 @@ HEADERS_SECURITE: dict[str, str] = {
 }
 
 logger = logging.getLogger("keyrock.api")
+
+
+def parse_reseau(brut: str) -> tuple[str, ...]:
+    """Normalise une liste de réseaux de confiance (CIDR ou IP seule).
+
+    Toute entrée invalide est ignorée silencieusement : un réseau mal saisi
+    doit dégrader vers « aucune confiance », jamais vers « tout est fiable ».
+    """
+    valides: list[str] = []
+    for morceau in brut.replace(";", ",").split(","):
+        candidat = morceau.strip()
+        if not candidat:
+            continue
+        try:
+            valides.append(str(ipaddress.ip_network(candidat, strict=False)))
+        except ValueError:
+            logger.warning("reseau_de_confiance_invalide_ignore", extra={"valeur": candidat})
+    return tuple(valides)
+
+
+def resoudre_ip_client(request: Request, proxies: Iterable[str]) -> str | None:
+    """Adresse du client réel, ou `None` si elle ne peut pas être établie.
+
+    Fonction utilitaire exposée pour les tests : la logique elle-même vit
+    dans `RateLimiterMiddleware._adresse`.
+    """
+    limite = RateLimiterMiddleware.__new__(RateLimiterMiddleware)
+    limite._proxies = tuple(ipaddress.ip_network(c, strict=False) for c in proxies)
+    return limite._adresse(request)
 
 
 def obtenir_request_id(request: Request) -> str:
@@ -113,33 +146,143 @@ def configure_logging(niveau: str = "INFO") -> None:
 
 
 class RateLimiterMiddleware(BaseHTTPMiddleware):
-    """Rate limiting en mémoire (fenêtre glissante), par IP.
+    """Rate limiting en mémoire (fenêtre glissante), par IP réelle.
+
+    Trois propriétés que cette classe garantit explicitement :
+
+    1. **L'adresse utilisée est la socket, pas un en-têtearbitrable.** Un
+       `X-Forwarded-For` n'est lu que si le pair est un reverse proxy
+       explicitement déclaré. Aucune confiance n'est accordée par défaut.
+    2. **L'empreinte mémoire est bornée.** Un attaquant ne peut pas créer une
+       entrée par requête en faisant tourner des adresses.
+    3. **Jamais de contournement par repli.** Un client dont l'adresse n'est pas
+       déterminable est refusé (403). Un client réel dont l'en-tête a été
+       écarté retombe sur le pair, ce qui le **mutualise** volontairement : il
+       reste soumis au quota, mais ne peut pas obtenir un quota illimité en
+       forgeant des en-têtes.
 
     Aucun état n'est persisté sur disque : compteur volatile uniquement.
     """
 
-    def __init__(self, app: Any, max_requetes: int = 60, fenetre_secondes: int = 60) -> None:
+    def __init__(
+        self,
+        app: Any,
+        max_requetes: int = 60,
+        fenetre_secondes: int = 60,
+        proxies_de_confiance: Iterable[str] = (),
+        max_clients_suivis: int = 10_000,
+    ) -> None:
         super().__init__(app)
         self.max_requetes = max(1, max_requetes)
         self.fenetre_secondes = max(1, fenetre_secondes)
-        self._hits: dict[str, deque[float]] = defaultdict(deque)
+        self.max_clients_suivis = max(16, max_clients_suivis)
+        self._proxies = tuple(ipaddress.ip_network(c, strict=False) for c in proxies_de_confiance)
+        # dict et non defaultdict : `get` ne crée pas d'entrée, donc une
+        # simple lecture ne consomme pas de mémoire.
+        self._hits: dict[str, deque[float]] = {}
+        self._dernier_acces: dict[str, float] = {}
+        self._verrou = threading.Lock()
 
-    def _autorise(self, cle: str) -> tuple[bool, int]:
+    # -- Résolution de l'adresse -----------------------------------------
+    def _est_proxy_de_confiance(self, adresse: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(adresse)
+        except ValueError:
+            return False
+        return any(ip in reseau for reseau in self._proxies)
+
+    def _adresse(self, request: Request) -> str | None:
+        """Adresse du client réel, ou `None` si elle ne peut pas être établie.
+
+        Trois cas, du plus fiable au plus dégradé :
+
+        * pair **non** déclaré proxy → le pair EST le client, l'en-tête est ignoré ;
+        * pair déclaré proxy et `X-Forwarded-For` exploitable → premier
+          encounteré en remontant depuis la droite, ce qui neutralise les
+          entrées prépendues par un attaquant ;
+        * pair déclaré proxy sans en-tête exploitable → on retombe sur le pair.
+
+        Le dernier cas est un repli **sûr**, pas un trou : tout le trafic ainsi
+        attribué au pair partage un seul seau, donc reste soumis au quota. Il se
+        produit quand Traefik est joint via un port publié (trafic « hairpin » :
+        le pair est alors la passerelle Docker) ou quand l'API est publiee
+        directement. Refuser (403) casserait le trafic légitime sans apporter de
+        sécurité supplémentaire.
+        """
+        pair = request.client.host if request.client else None
+        if not pair:
+            return None
+        if not self._est_proxy_de_confiance(pair):
+            return pair
+        brut = request.headers.get("x-forwarded-for", "")
+        for candidat in reversed([part.strip() for part in brut.split(",") if part.strip()]):
+            if not self._est_proxy_de_confiance(candidat):
+                return candidat
+        return pair
+
+    # -- Comptage ----------------------------------------------------------
+    def _purger(self, maintenant: float) -> None:
+        """Retire les entrées sans requête ni expirées. Appelé sous verrou."""
+        expire = maintenant - self.fenetre_secondes
+        for cle in [
+            c
+            for c, horodatages in self._hits.items()
+            if not horodatages or horodatages[-1] <= expire
+        ]:
+            del self._hits[cle]
+            self._dernier_acces.pop(cle, None)
+        if len(self._hits) < self.max_clients_suivis:
+            return
+        # Bornitude mémoire : éviction des entrées les moins récemment
+        # utilisées. Ce n'est PAS une frontière de sécurité (un attaquant
+        # peut encore évincer un client légitime) — c'est un garde-fou
+        # contre l'épuisement de la mémoire.
+        cibles = sorted(self._dernier_acces, key=self._dernier_acces.get)  # type: ignore[arg-type]
+        for cle in cibles[: len(self._hits) - self.max_clients_suivis + 1]:
+            self._hits.pop(cle, None)
+            self._dernier_acces.pop(cle, None)
+
+    def _autorise(self, cle: str) -> tuple[bool, int, int]:
+        """Retourne (autorisé, retry_apres, restantes). Appelé sous verrou."""
         maintenant = time.monotonic()
-        horodatages = self._hits[cle]
-        while horodatages and horodatages[0] <= maintenant - self.fenetre_secondes:
+        self._purger(maintenant)
+        horodatages = self._hits.get(cle)
+        if horodatages is None:
+            horodatages = deque()
+            self._hits[cle] = horodatages
+        expire = maintenant - self.fenetre_secondes
+        while horodatages and horodatages[0] <= expire:
             horodatages.popleft()
         if len(horodatages) >= self.max_requetes:
             restant = int(self.fenetre_secondes - (maintenant - horodatages[0]))
-            return False, max(restant, 1)
+            self._dernier_acces[cle] = maintenant
+            return False, max(restant, 1), 0
         horodatages.append(maintenant)
-        return True, 0
+        self._dernier_acces[cle] = maintenant
+        # Solde reflecti l'etat APRES la requete courante, comme attendu par
+        # les en-tetes de quota usuels.
+        return True, 0, max(0, self.max_requetes - len(horodatages))
 
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        client = request.client.host if request.client else "inconnu"
-        autorise, retry_apres = self._autorise(client)
+        client = self._adresse(request)
+        if client is None:
+            # Fail-closed : ni pair ni en-tête exploitable. On `return` et non
+            # `raise` : un middleware s'exécute hors de la chaîne d'exception
+            # handlers, un `raise` deviendrait un 500.
+            logger.warning("adresse_client_indeterminee", extra={"path": request.url.path})
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "code": "ADRESSE_INDETERMINEE",
+                        "message": ("Adresse client non déterminable. Requête refusée."),
+                    }
+                },
+            )
+        with self._verrou:
+            autorise, retry_apres, restantes = self._autorise(client)
         if not autorise:
             logger.warning(
                 "rate_limit_exceeded", extra={"client": client, "path": request.url.path}
@@ -156,9 +299,7 @@ class RateLimiterMiddleware(BaseHTTPMiddleware):
             )
         reponse = await call_next(request)
         reponse.headers["X-RateLimit-Limit"] = str(self.max_requetes)
-        reponse.headers["X-RateLimit-Remaining"] = str(
-            max(0, self.max_requetes - len(self._hits[client]))
-        )
+        reponse.headers["X-RateLimit-Remaining"] = str(restantes)
         return reponse
 
 

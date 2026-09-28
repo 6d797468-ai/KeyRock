@@ -1,0 +1,28 @@
+# Dépendances de RUNTIME — installées dans l'image de production.
+#
+# Règle : rien ici ne doit être nécessaire uniquement pour compiler, tester ou
+# analyser le code. L'outillage de développement est dans requirements-dev.txt.
+# Une violation de cette séparation a coûté 61 Mo (mypy) dans l'image.
+#
+# Runtime réel de l'image : l'API (keyrock_api), la TUI (keyrock_cli, incluse
+# pour que `kr` fonctionne dans le conteneur) et l'installeur (keyrock_shell).
+
+# API REST
+fastapi>=0.110
+# `uvicorn` sans l'extra `[standard]` : cet extra ajoute uvloop, httptools,
+# websockets, watchfiles, PyYAML et pygments, soit ~36 Mo, pour du rechargement
+# à chaud (développement), du WebSocket et des accélérations C. KeyRock est une
+# API REST sans WebSocket et sans rechargement à chaud : rien de tout cela n'est
+# utilisé.
+uvicorn>=0.27
+pydantic>=2.6
+pydantic-settings>=2.2
+# Obligatoire : pydantic-settings l'importe pour lire le `.env` déclaré dans
+# `SettingsConfigDict(env_file=".env")`. Sans lui, le démarrage échoue.
+python-dotenv>=1.0
+structlog>=24.1
+
+# Interface terminal (CLI / TUI)
+rich>=13.7
+pyperclip>=1.8
+textual>=0.80

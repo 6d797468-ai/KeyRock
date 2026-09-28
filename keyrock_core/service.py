@@ -17,6 +17,7 @@ from keyrock_core.generator import (
     LONGEUR_MIN,
     CoreGenerator,
     GenerationOptions,
+    LongueurHorsBornesError,
 )
 
 __all__ = [
@@ -161,20 +162,19 @@ class GenerationService:
 
     # -- Écriture ----------------------------------------------------------
     def set_longueur(self, longueur: int) -> None:
-        """Applique les bornes 8..1024 et le seuil d'entropie configuré."""
+        """Applique les bornes 8..1024 et le seuil d'entropie configuré.
+
+        Les deux contrôles sont délégués au noyau : les dupliquer ici avait
+        produit un message d'erreur différent de celui de l'API pour une
+        situation identique, et une borne d'entropie non identique.
+        """
         if not LONGEUR_MIN <= longueur <= LONGEUR_MAX:
-            raise ValueError(
+            raise LongueurHorsBornesError(
                 f"longueur doit être comprise entre {LONGEUR_MIN} et {LONGEUR_MAX} "
                 f"(reçu : {longueur})"
             )
         candidat = replace(self.etat.options, longueur=longueur)
-        entropie = CoreGenerator.calculer_entropie(candidat)
-        if entropie < self.settings.token_min_entropy:
-            raise ValueError(
-                f"Entropie insuffisante : {entropie} bits < "
-                f"{self.settings.token_min_entropy} bits. Augmentez la longueur ou "
-                "activez plus de types de caractères."
-            )
+        CoreGenerator.valider_entropie(candidat, self.settings.token_min_entropy)
         self.etat.set_longueur(longueur)
 
     def basculer(self, champ: str) -> bool:

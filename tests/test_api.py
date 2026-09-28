@@ -29,6 +29,42 @@ class TestSante:
         assert corps["longueur_max"] == LONGEUR_MAX
         assert corps["entropie_min"] == 80
 
+    def test_meta_publie_le_minimum_effectif_par_alphabet(self, client: TestClient) -> None:
+        corps = client.get("/api/v1/meta").json()
+        table = corps["longueur_min_par_alphabet"]
+        assert table["maj+min+num+sym"]["longueur_min"] == 13
+        assert table["maj+min+num"]["longueur_min"] == 14
+        assert table["maj+min"]["longueur_min"] == 15
+        assert table["num"]["longueur_min"] == 25
+
+    def test_minimum_publie_est_toujours_accepté(self, client: TestClient) -> None:
+        """Boucle fermée sur le contrat : ce que `meta` annonce, `generate` l'accepte.
+
+        C'est l'invariant violé avant correction : `meta` annonçait 8, `generate`
+        refusait 8. Le test lit le contrat puis l'exerce, pour que le contrat ne
+        puisse plus mentir en silence.
+        """
+        table = client.get("/api/v1/meta").json()["longueur_min_par_alphabet"]
+        drapeaux = {
+            "maj+min+num+sym": (True, True, True, True),
+            "maj+min+num": (True, True, True, False),
+            "maj+min": (True, True, False, False),
+            "num": (False, False, True, False),
+        }
+        for libelle, (maj, min_, chiffres, symboles) in drapeaux.items():
+            reponse = client.post(
+                "/api/v1/generate",
+                json={
+                    "longueur": table[libelle]["longueur_min"],
+                    "majuscules": maj,
+                    "minuscules": min_,
+                    "chiffres": chiffres,
+                    "symboles": symboles,
+                },
+            )
+            assert reponse.status_code == 200, f"{libelle} : {reponse.text}"
+            assert reponse.json()["entropie_bits"] >= 80
+
 
 class TestGenerate:
     def test_generation_par_defaut(self, client: TestClient) -> None:
@@ -93,9 +129,55 @@ class TestGenerate:
 class TestValidation:
     @pytest.mark.parametrize("longueur", [LONGEUR_MIN - 1, 0, -5, LONGEUR_MAX + 1])
     def test_longueur_hors_bornes(self, client: TestClient, longueur: int) -> None:
+        """Hors bornes = code propre, et un message dans la langue de l'API.
+
+        Régression : le message venait directement de Pydantic, en anglais,
+        au milieu d'un corps de réponse francophone.
+        """
         reponse = client.post("/api/v1/generate", json={"longueur": longueur})
         assert reponse.status_code == 422
-        assert reponse.json()["error"]["code"] in {"REQUETE_INVALIDE", "ENTROPIE_INSUFFISANTE"}
+        erreur = reponse.json()["error"]
+        assert erreur["code"] == "LONGUEUR_HORS_BORNES"
+        assert erreur["champ"] == "body.longueur"
+        assert f"entre {LONGEUR_MIN} et {LONGEUR_MAX}" in erreur["message"]
+
+    @pytest.mark.parametrize(
+        ("corps", "code_attendu"),
+        [
+            ({"longueur": 8}, "ENTROPIE_INSUFFISANTE"),
+            (
+                {"longueur": 24, "majuscules": False, "minuscules": False, "symboles": False},
+                "ENTROPIE_INSUFFISANTE",
+            ),
+            (
+                {
+                    "majuscules": False,
+                    "minuscules": False,
+                    "chiffres": False,
+                    "symboles": False,
+                },
+                "ALPHABET_VIDE",
+            ),
+        ],
+    )
+    def test_echecs_distinguets(
+        self, client: TestClient, corps: dict[str, object], code_attendu: str
+    ) -> None:
+        """Bornes, entropie et alphabet vide sont trois échecs, trois codes.
+
+        Les confondre envoie le client vers la mauvaise correction :
+        `LONGUEUR_HORS_BORNES` et `ENTROPIE_INSUFFISANTE` ne se réparent pas
+        de la même façon.
+        """
+        reponse = client.post("/api/v1/generate", json=corps)
+        assert reponse.status_code == 422
+        assert reponse.json()["error"]["code"] == code_attendu
+
+    def test_erreur_entropie_nomme_la_longueur_requise(self, client: TestClient) -> None:
+        """Le message doit porter la correction, pas seulement le constat."""
+        reponse = client.post("/api/v1/generate", json={"longueur": 8})
+        message = reponse.json()["error"]["message"]
+        assert "13 caractères" in message
 
     def test_alphabet_vide_rejete(self, client: TestClient) -> None:
         reponse = client.post(

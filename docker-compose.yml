@@ -19,7 +19,12 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - letsencrypt:/letsencrypt
     networks:
-      - keyrock
+      keyrock:
+        # IP statique : c'est elle, et elle seule, que l'API déclare comme
+        # proxy de confiance (KEYROCK_TRUSTED_PROXIES dans le Dockerfile).
+        # Un réseau entier en confiance laisserait n'importe quel conteneur
+        # usurper un X-Forwarded-For et obtenir un quota illimité.
+        ipv4_address: 172.20.0.10
     restart: unless-stopped
 
   api:
@@ -41,7 +46,8 @@ services:
     expose:
       - "8000"
     networks:
-      - keyrock
+      keyrock:
+        ipv4_address: 172.20.0.11
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -75,6 +81,14 @@ services:
 networks:
   keyrock:
     driver: bridge
+    ipam:
+      driver: default
+      config:
+        # Sous-reseau epingle. Les adresses de service sont fixes : la confiance
+        # de l'API se limite au /32 de Traefik (172.20.0.10), jamais au sous-
+        # reseau. Changer l'une sans l'autre casse silencieusement la chaine
+        # de confiance.
+        - subnet: 172.20.0.0/16
 
 volumes:
   letsencrypt:

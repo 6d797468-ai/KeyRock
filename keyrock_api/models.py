@@ -5,23 +5,29 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from keyrock_core.generator import (
+    COMPOSITIONS_NOMMEES,
     ENTROPIE_MIN,
     LONGEUR_MAX,
     LONGEUR_MIN,
+    AlphabetVideError,
     CoreGenerator,
     GenerationOptions,
+    LongueurHorsBornesError,
 )
 
 __all__ = [
+    "COMPOSITIONS_NOMMEES",
     "ENTROPIE_MIN",
     "LONGEUR_MAX",
     "LONGEUR_MIN",
+    "AlphabetMinimum",
     "ErrorDetail",
     "ErrorResponse",
     "GenerateRequest",
     "GenerateResponse",
     "HealthResponse",
     "MetaResponse",
+    "SanteControle",
 ]
 
 
@@ -64,22 +70,24 @@ class GenerateRequest(BaseModel):
     @classmethod
     def _verifier_longueur(cls, valeur: int) -> int:
         if not LONGEUR_MIN <= valeur <= LONGEUR_MAX:
-            raise ValueError(f"longueur doit être comprise entre {LONGEUR_MIN} et {LONGEUR_MAX}")
+            raise LongueurHorsBornesError(
+                f"longueur doit être comprise entre {LONGEUR_MIN} et {LONGEUR_MAX} (reçu: {valeur})"
+            )
         return valeur
 
     @model_validator(mode="after")
     def _verifier_alphabet_et_entropie(self) -> GenerateRequest:
         if not any((self.majuscules, self.minuscules, self.chiffres, self.symboles)):
-            raise ValueError(
+            raise AlphabetVideError(
                 "au moins un type de caractère doit être activé "
                 "(majuscules, minuscules, chiffres, symboles)"
             )
-        entropie = CoreGenerator.calculer_entropie(self.vers_options())
-        if entropie < self.seuil_entropie:
-            raise ValueError(
-                f"entropie insuffisante : {entropie} bits < {self.seuil_entropie} bits "
-                "requis ; augmentez la longueur ou activez plus de types de caractères"
-            )
+        # `valider_entropie` lève `EntropieInsuffisanteError`, qui porte le
+        # minimum exact à atteindre dans son message. La borne de longueur et
+        # le seuil d'entropie sont deux échecs distincts, avec deux codes et
+        # deux corrections distinctes : augmenter la longueur ne dispense pas
+        # d'élargir l'alphabet, ni l'inverse.
+        CoreGenerator.valider_entropie(self.vers_options(), self.seuil_entropie)
         return self
 
     def vers_options(self) -> GenerationOptions:
@@ -110,17 +118,62 @@ class GenerateResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    status: str
+    """État de santé effectif, pas une constante."""
+
+    status: str = Field(description="`ok`, `degraded` ou `ko`.")
     version: str
+    controles: list[SanteControle] = Field(
+        default_factory=list, description="Détail de chaque contrôle effectué."
+    )
+
+
+class SanteControle(BaseModel):
+    """Un contrôle nommé et son résultat."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    nom: str
+    ok: bool
+    bloquant: bool = Field(
+        description="Vrai si l'échec de ce contrôle rend le service indisponible."
+    )
+    detail: str
+
+
+class AlphabetMinimum(BaseModel):
+    """Longueur minimale réelle pour une combinaison de classes de caractères."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    nom: str | None = Field(
+        default=None, description="Nom de composition si elle existe, ex. `alnum`."
+    )
+    alphabet: int = Field(description="Nombre de caractères distincts disponibles.")
+    entropie_par_caractere: float = Field(description="log2(|alphabet|), en bits.")
+    longueur_min: int = Field(
+        description="Longueur minimale atteignant `entropie_min` avec cet alphabet."
+    )
 
 
 class MetaResponse(BaseModel):
     nom: str
     version: str
     description: str
-    longueur_min: int
+    longueur_min: int = Field(
+        description=(
+            "Borne de saisie inférieure. Ce n'est PAS une longueur utilisable : "
+            "consulter `longueur_min_par_alphabet` pour le minimum réel."
+        )
+    )
     longueur_max: int
-    entropie_min: float
+    entropie_min: float = Field(description="Seuil d'entropie appliqué par défaut, en bits.")
+    longueur_min_par_alphabet: dict[str, AlphabetMinimum] = Field(
+        description=(
+            "Longueur minimale effective, par combinaison de classes. Clé = libellé "
+            "canonique (`maj+min+num+sym`). C'est ce tableau qu'un client doit "
+            "consulter avant d'envoyer une longueur."
+        )
+    )
     persistance: str = "aucune (zéro persistance)"
 
 

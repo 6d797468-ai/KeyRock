@@ -5,7 +5,11 @@ from __future__ import annotations
 import pytest
 
 from keyrock_core.config import KeyRockSettings
-from keyrock_core.generator import LONGEUR_MAX, LONGEUR_MIN
+from keyrock_core.generator import (
+    LONGEUR_MAX,
+    LONGEUR_MIN,
+    EntropieInsuffisanteError,
+)
 from keyrock_core.service import (
     GenerationResultat,
     GenerationService,
@@ -88,7 +92,7 @@ class TestServiceEcriture:
         service.definir("majuscules", False)
         service.definir("minuscules", False)
         service.definir("symboles", False)
-        with pytest.raises(ValueError, match="Entropie insuffisante"):
+        with pytest.raises(EntropieInsuffisanteError):
             service.set_longueur(8)
 
     def test_basculer(self, service: GenerationService) -> None:

@@ -23,18 +23,22 @@ from keyrock_api.middleware import (
     configure_logging,
     gerer_erreurs,
     obtenir_request_id,
+    parse_reseau,
 )
 from keyrock_api.models import (
     ENTROPIE_MIN,
     LONGEUR_MAX,
     LONGEUR_MIN,
+    AlphabetMinimum,
     ErrorResponse,
     GenerateRequest,
     GenerateResponse,
     HealthResponse,
     MetaResponse,
+    SanteControle,
     alphabet_pour,
 )
+from keyrock_api.sante import verifier_sante
 from keyrock_core.config import get_settings
 from keyrock_core.generator import CoreGenerator
 
@@ -74,7 +78,12 @@ def creer_application() -> FastAPI:
 
     # L'ordre compte : SecurityHeaders est le plus externe (ajoute les
     # en-têtes à toutes les réponses, y compris celles du rate limiter).
-    application.add_middleware(RateLimiterMiddleware, max_requetes=settings.rate_limit_per_minute)
+    application.add_middleware(
+        RateLimiterMiddleware,
+        max_requetes=settings.rate_limit_per_minute,
+        proxies_de_confiance=parse_reseau(settings.trusted_proxies),
+        max_clients_suivis=settings.max_tracked_clients,
+    )
     application.add_middleware(SecurityHeadersMiddleware)
     if settings.cors_allow_origins:
         application.add_middleware(
@@ -89,10 +98,40 @@ def creer_application() -> FastAPI:
     application.add_exception_handler(Exception, gerer_erreurs)
     application.add_exception_handler(RequestValidationError, _valider_entree)
 
-    @application.get("/health", response_model=HealthResponse, tags=["système"])
-    async def health() -> HealthResponse:
-        """Sonde de vivacité pour Docker HEALTHCHECK et Traefik."""
-        return HealthResponse(status="ok", version=VERSION)
+    @application.get(
+        "/health",
+        response_model=HealthResponse,
+        tags=["système"],
+        responses={503: {"model": HealthResponse, "description": "Configuration bloquante"}},
+    )
+    async def health() -> JSONResponse | HealthResponse:
+        """Sonde de vivacité : vérifie que la configuration permet de servir.
+
+        Répond 503 si un contrôle bloquant échoue, pour que le HEALTHCHECK
+        Docker et Traefik Cessent de considérer sain un service qui ne peut
+        rien produire. Un avertissement reste en 200 : le traiter comme
+        bloquant provoquerait une boucle de redémarrage.
+        """
+        rapport = verifier_sante(get_settings())
+        reponse = HealthResponse(
+            status=rapport.statut,
+            version=VERSION,
+            controles=[
+                SanteControle(
+                    nom=controle.nom,
+                    ok=controle.ok,
+                    bloquant=controle.bloquant,
+                    detail=controle.detail,
+                )
+                for controle in rapport.controles
+            ],
+        )
+        if not rapport.disponible:
+            logger.error("sante_bloquante", extra={"controles": rapport.statut})
+            return JSONResponse(status_code=503, content=reponse.model_dump())
+        if rapport.statut == "degraded":
+            logger.warning("sante_avertissement")
+        return reponse
 
     @application.get("/api/v1/meta", response_model=MetaResponse, tags=["système"])
     async def meta() -> MetaResponse:
@@ -104,6 +143,10 @@ def creer_application() -> FastAPI:
             longueur_min=LONGEUR_MIN,
             longueur_max=LONGEUR_MAX,
             entropie_min=ENTROPIE_MIN,
+            longueur_min_par_alphabet={
+                libelle: AlphabetMinimum(**donnees)
+                for libelle, donnees in CoreGenerator.decrire_alphabets(ENTROPIE_MIN).items()
+            },
         )
 
     @application.post(
@@ -126,19 +169,28 @@ def creer_application() -> FastAPI:
                 options, nombre=requete.nombre, seuil_entropie=requete.seuil_entropie
             )
         except ValueError as exc:
-            # Aucune fuite de token : l'erreur ne contient que des métadonnées.
+            # Filet de sécurité, non atteignable par le chemin validé : le
+            # modèle `GenerateRequest` a déjà appliqué les mêmes bornes et le
+            # même seuil. Conservé pour qu'un relâchement futur du validateur
+            # reste en échec fermé plutôt qu'en émission silencieuse. Le code
+            # vient de l'exception, jamais d'une constante : c'est ce qui
+            # avait produit ici un `ENTROPIE_INSUFFISANTE` codé en dur pour
+            # toute erreur, longueur comprise.
             logger.warning(
                 "generation_refusee",
                 extra={
                     "request_id": obtenir_request_id(request),
                     "longueur": requete.longueur,
-                    "raison": "entropie_insuffisante",
+                    "raison": getattr(exc, "code", "REQUETE_INVALIDE"),
                 },
             )
             return JSONResponse(
                 status_code=422,
                 content={
-                    "error": {"code": "ENTROPIE_INSUFFISANTE", "message": str(exc)},
+                    "error": {
+                        "code": getattr(exc, "code", "REQUETE_INVALIDE"),
+                        "message": str(exc),
+                    },
                     "request_id": obtenir_request_id(request),
                 },
             )
@@ -177,9 +229,9 @@ async def _valider_entree(request: Request, exc: Exception) -> JSONResponse:
     erreurs = exc.errors() if isinstance(exc, RequestValidationError) else []
     details = [
         {
-            "code": "REQUETE_INVALIDE",
+            "code": _code_erreur(item),
             "message": _message_sanitisee(item),
-            "champ": ".".join(str(partie) for partie in item.get("loc", ())),
+            "champ": _champ(item),
         }
         for item in erreurs
     ]
@@ -199,21 +251,50 @@ async def _valider_entree(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
+def _champ(erreur: dict[str, Any]) -> str | None:
+    """Champ fautif, ou `None` quand l'erreur porte sur une combinaison.
+
+    Un validateur de modèle est localisé à `body` seulement : désigner `body`
+    comme champ fautif est trompeur, car aucun champ précis n'est en cause —
+    c'est leur combinaison. Le client doit donc lire le message.
+    """
+    chemin = [str(partie) for partie in erreur.get("loc", ())]
+    if len(chemin) <= 1:
+        return None
+    return ".".join(chemin)
+
+
+def _code_erreur(erreur: dict[str, Any]) -> str:
+    """Code machine lisible, propagé par nos propres validateurs.
+
+    Pydantic conserve l'exception d'origine dans `ctx["error"` : nos classes
+    d'erreur du noyau y transportent leur `code`, ce qui permet de distinguer
+    « longueur hors bornes » de « entropie insuffisante » — deux échecs qui
+    n'appellent pas la même correction côté client.
+    """
+    origine = erreur.get("ctx", {}).get("error")
+    code = getattr(origine, "code", None)
+    if isinstance(code, str):
+        return code
+    type_erreur = erreur.get("type", "")
+    if type_erreur in {"greater_than_equal", "less_than_equal"}:
+        return "LONGUEUR_HORS_BORNES"
+    return "REQUETE_INVALIDE"
+
+
 def _message_sanitisee(erreur: dict[str, Any]) -> str:
     """Ne conserve que les messages de nos propres validateurs.
 
     Les messages natifs de Pydantic (types, chemins de classes) sont
-    remplacés par un texte générique pour ne rien divulguer.
+    remplacés par un texte générique pour ne rien divulguer — sauf pour les
+    bornes de longueur, traduites ici pour que la réponse reste dans la langue
+    du reste de l'API. Aucun autre type natif n'est traduit : le repli
+    générique est le comportement sûr.
     """
     type_erreur = erreur.get("type", "")
-    types_natifs = {
-        "value_error",
-        "too_short",
-        "too_long",
-        "greater_than_equal",
-        "less_than_equal",
-    }
-    if type_erreur in types_natifs:
+    if type_erreur in {"greater_than_equal", "less_than_equal"}:
+        return f"longueur doit être comprise entre {LONGEUR_MIN} et {LONGEUR_MAX}"
+    if type_erreur == "value_error":
         return str(erreur.get("msg", "Paramètres invalides.")).removeprefix("Value error, ")
     return "Paramètres de requête invalides."
 
