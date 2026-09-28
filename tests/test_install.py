@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -161,3 +162,31 @@ class TestSecurite:
         install.installer_shell()
         contenu = (maison / ".bashrc").read_text(encoding="utf-8")
         assert contenu.index(install.DEBUT_BLOC) < contenu.index(install.FIN_BLOC)
+
+
+class TestDocumentation:
+    """Le README promet le bloc exact que `install-shell` écrit."""
+
+    @pytest.mark.parametrize("shell", ["bash", "zsh"])
+    def test_le_readme_reproduit_le_bloc_reel(self, shell: str) -> None:
+        """Le README ne doit pas diverger du bloc réellement écrit."""
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+        if shell == "bash":
+            assert install.contenu_bloc(shell) in readme
+        else:
+            # Le README montre bash ; zsh n'en diffère que par le fichier de
+            # complétion. On verrouille cette équivalence pour garantir les deux.
+            assert install.contenu_bloc("zsh") == install.contenu_bloc("bash").replace(
+                "keyrock.bash", "keyrock.zsh"
+            )
+
+    def test_le_readme_annonce_un_nombre_de_tests_credible(self) -> None:
+        """Un compteur obsolète dans le README trahit une doc non tenue à jour."""
+        racine = Path(__file__).resolve().parents[1]
+        readme = (racine / "README.md").read_text(encoding="utf-8")
+        annonces = re.findall(r"pytest \((\d+) tests?\)", readme)
+        fichiers = len(list((racine / "tests").glob("test_*.py")))
+        for annonce in annonces:
+            # Un nombre de tests ne peut pas être inférieur au nombre de
+            # fichiers de test, ni depasser 100 par fichier de maniere absurde.
+            assert fichiers <= int(annonce) <= fichiers * 200

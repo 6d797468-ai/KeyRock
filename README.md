@@ -60,7 +60,7 @@ keyrock/
 │   ├── main.py             # routes, cycle de vie, handlers d'erreurs
 │   ├── models.py           # Pydantic request/response + validation entropie
 │   └── middleware.py       # rate limiting, en-têtes, logs structurés
-├── tests/                  # pytest (306 tests)
+├── tests/                  # pytest (320 tests)
 ├── Dockerfile              # multi-stage, USER non-root, HEALTHCHECK
 ├── docker-compose.yml      # API + Traefik (HTTPS, rate limit, HSTS)
 ├── requirements.txt
@@ -127,11 +127,14 @@ secrets.`
 # Bloc géré par KeyRock. Ne pas éditer à la main.
 # `kr install-shell` / `kr uninstall-shell` le gèrent de façon idempotente.
 export PATH="$HOME/.local/bin:$PATH"
+XDG="${XDG_CONFIG_HOME:-$HOME/.config}/keyrock/shell/keyrock.bash"
+[ -r "$XDG" ] && . "$XDG"
 # <<< KEYROCK <<<
 ```
 
-Plus des complétions dans `~/.config/keyrock/shell/`. La TUI ne dépend
-**jamais** de ce bloc : elle fonctionne sans shell configuré.
+Le bloc charge aussi les complétions générées dans `~/.config/keyrock/shell/`
+(fichier `keyrock.zsh` pour zsh). La TUI ne dépend **jamais** de ce bloc : elle
+fonctionne sans shell configuré.
 
 ## Utilisation — TUI
 
