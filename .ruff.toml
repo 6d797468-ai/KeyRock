@@ -1,0 +1,15 @@
+target-version = "py310"
+line-length = 100
+extend-exclude = [".venv", "__pycache__"]
+
+[lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF", "S", "ASYNC", "PTH", "T20"]
+ignore = ["S101"]
+
+[lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S311"]
+# La sortie --json doit bypasser rich : print() est volontaire.
+"keyrock_shell/cli.py" = ["T201"]
+
+[lint.flake8-bandit]
+check-typed-exception = false

@@ -1,0 +1,23 @@
+# Contexte de build minimal : aucune source de test ni config locale n'est
+# embarquée dans l'image finale.
+.git
+.github
+.gitignore
+.env
+.env.*
+!.env.example
+tests/
+*.md
+!README.md
+.pytest_cache
+.mypy_cache
+.ruff_cache
+__pycache__
+*.py[cod]
+.venv
+venv
+main.py
+pyproject.toml
+docker-compose.yml
+Dockerfile
+logo-favicon/

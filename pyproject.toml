@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keyrock"
+version = "1.0.0"
+description = "Générateur de clés & tokens cryptographiques (CSPRNG) — Vextra Agency"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Nawfel Reghai" }]
+keywords = ["securite", "csprng", "generation", "mots-de-passe", "tokens"]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    "rich>=13.7",
+    "pyperclip>=1.8",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "structlog>=24.1",
+    "textual>=0.80",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "httpx>=0.27",
+    "ruff>=0.4",
+    "mypy>=1.9",
+]
+
+[project.scripts]
+kr = "keyrock_shell.cli:main"
+keyrock = "keyrock_cli.app:main"
+keyrock-api = "keyrock_api.main:app"
+
+[tool.setuptools]
+packages = ["keyrock_core", "keyrock_cli", "keyrock_api", "keyrock_shell"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = ["error::DeprecationWarning:keyrock.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [".venv", "__pycache__", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF", "S", "ASYNC", "PTH", "T20"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S311"]
+# La sortie --json doit bypasser rich : print() est volontaire.
+"keyrock_shell/cli.py" = ["T201"]
+
+[tool.ruff.lint.flake8-bandit]
+check-typed-exception = false
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_unused_ignores = false
+files = ["keyrock_core", "keyrock_api", "keyrock_cli"]
+
+[[tool.mypy.overrides]]
+module = ["pyperclip.*", "structlog.*"]
+ignore_missing_imports = true

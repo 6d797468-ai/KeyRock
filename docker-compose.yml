@@ -1,0 +1,80 @@
+name: keyrock
+
+services:
+  traefik:
+    image: traefik:v3.1
+    command:
+      - --api.dashboard=false
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-contact@vextra.agency}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt:/letsencrypt
+    networks:
+      - keyrock
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: keyrock:1.0.0
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      KEYROCK_API_HOST: 0.0.0.0
+      KEYROCK_API_PORT: "8000"
+      KEYROCK_LOG_LEVEL: ${KEYROCK_LOG_LEVEL:-INFO}
+      KEYROCK_TOKEN_MIN_LENGTH: ${KEYROCK_TOKEN_MIN_LENGTH:-8}
+      KEYROCK_TOKEN_MAX_LENGTH: ${KEYROCK_TOKEN_MAX_LENGTH:-1024}
+      KEYROCK_TOKEN_MIN_ENTROPY: ${KEYROCK_TOKEN_MIN_ENTROPY:-80}
+      KEYROCK_RATE_LIMIT_PER_MINUTE: ${KEYROCK_RATE_LIMIT_PER_MINUTE:-60}
+    expose:
+      - "8000"
+    networks:
+      - keyrock
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.keyrock.rule: Host(`${KEYROCK_DOMAIN:-api.keyrock.local}`) && (PathPrefix(`/api/v1`) || Path(`/health`) || Path(`/api/v1/meta`))
+      traefik.http.routers.keyrock.entrypoints: websecure
+      traefik.http.routers.keyrock.tls: "true"
+      traefik.http.routers.keyrock.tls.certresolver: letsencrypt
+      traefik.http.routers.keyrock.middlewares: keyrock-rate-limit,keyrock-secure
+      traefik.http.services.keyrock.loadbalancer.server.port: "8000"
+      traefik.http.middlewares.keyrock-rate-limit.ratelimit.average: "${KEYROCK_RATE_LIMIT_PER_MINUTE:-60}"
+      traefik.http.middlewares.keyrock-rate-limit.ratelimit.burst: "30"
+      traefik.http.middlewares.keyrock-secure.headers.stsSeconds: "31536000"
+      traefik.http.middlewares.keyrock-secure.headers.stsIncludeSubdomains: "true"
+      traefik.http.middlewares.keyrock-secure.headers.contentTypeNosniff: "true"
+      traefik.http.middlewares.keyrock-secure.headers.frameDeny: "true"
+      traefik.http.middlewares.keyrock-secure.headers.referrerPolicy: "no-referrer"
+      traefik.http.middlewares.keyrock-secure.headers.customResponseHeaders.Cache-Control: "no-store"
+
+networks:
+  keyrock:
+    driver: bridge
+
+volumes:
+  letsencrypt:
